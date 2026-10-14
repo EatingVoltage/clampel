@@ -11,6 +11,8 @@
     clampel raw "<line>"                             send one protocol line, print the replies
     clampel flash [firmware.bin]                     serial self-update (the only way after the eFuse)
     clampel fuse                                     burn DIS_USB_SERIAL_JTAG_DOWNLOAD_MODE (one-way)
+    clampel pair [--force]                           write lamp.json from the one ESP32-C3 plugged in
+    clampel hooks                                    print the hooks block for ~/.claude/settings.json
     clampel install                                  start the bridge at logon (Startup folder shortcut)
 
 Hooks only write one small JSON file per session. The bridge owns the COM port
@@ -50,6 +52,16 @@ NOTIFY_STATE = {"permission_prompt": "ask", "elicitation_dialog": "ask",
                 "quota_auto_resume_disabled": "done"}   # gave up waiting, your move
 # `hook fail` (StopFailure): these errors mean "out of usage until the reset", the rest just end the turn.
 CREDIT_ERRORS = ("rate_limit", "billing_error")
+# Claude Code hook event, matcher, `clampel hook <arg>`. `clampel hooks` prints this as settings.json.
+HOOKS = (("SessionStart",       "startup|resume|clear",         "start"),
+         ("UserPromptSubmit",   None,                           "input"),
+         ("PreToolUse",         "AskUserQuestion|ExitPlanMode", "ask"),
+         ("PostToolUse",        None,                           "think"),
+         ("PostToolUseFailure", None,                           "think"),
+         ("Notification",       "|".join(NOTIFY_STATE),         "notify"),
+         ("Stop",               None,                           "done"),
+         ("StopFailure",        None,                           "fail"),
+         ("SessionEnd",         None,                           "end"))
 
 
 # ── small helpers ────────────────────────────────────────────────────────────
@@ -83,7 +95,10 @@ def remove(path):
 
 
 def lamp_serial():
-    return read_json(LAMP_CFG)["serial"].upper()
+    """The paired lamp's USB serial number (= MAC), or None before `clampel pair`."""
+    cfg = read_json(LAMP_CFG)
+    sn = cfg.get("serial") if isinstance(cfg, dict) else None
+    return sn.upper() if sn else None
 
 
 def log(msg):
@@ -556,6 +571,11 @@ class Ctrl(socketserver.StreamRequestHandler):
 
 def cmd_bridge():
     os.makedirs(SESS_DIR, exist_ok=True)
+    sn = lamp_serial()
+    if not sn:
+        log("bridge not started: no lamp paired (run `clampel pair`)")
+        print("clampel: no lamp paired; run `clampel pair` first")
+        return
     socketserver.ThreadingTCPServer.allow_reuse_address = False
     socketserver.ThreadingTCPServer.daemon_threads = True
     try:
@@ -563,7 +583,7 @@ def cmd_bridge():
     except OSError:
         print("clampel: bridge already running")
         return
-    lamp = Lamp(lamp_serial())
+    lamp = Lamp(sn)
     server.lamp = lamp
     log("bridge up, pid %d, lamp %s" % (os.getpid(), lamp.sn))
 
@@ -586,7 +606,7 @@ def bridge_running():
 
 
 def ensure_bridge():
-    if bridge_running():
+    if not os.path.exists(LAMP_CFG) or bridge_running():
         return
     os.makedirs(SESS_DIR, exist_ok=True)
     exe = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
@@ -659,6 +679,10 @@ def cmd_flash(path):
 def cmd_stop():
     if bridge_running():
         ctrl_one({"cmd": "stop"})
+        for _ in range(30):                 # wait for it to let go, so a `start` right after works
+            if not bridge_running():
+                break
+            time.sleep(0.1)
         print("bridge stopped, COM port released")
     else:
         print("bridge not running")
@@ -669,13 +693,14 @@ def cmd_fuse():
 
     Needs `python -m pip install esptool "bitstring<5"` for this interpreter:
     PlatformIO's bundled espefuse lacks `cryptography`, and bitstring 5 dropped the
-    BitStream class espefuse imports (both seen 2026-10-12, esptool 5.5.0).
-    The lamp 48:F6:EE:13:EC:44 was fused on 2026-10-12; this is for a new lamp."""
+    BitStream class espefuse imports (both seen 2026-10-12, esptool 5.5.0)."""
     import importlib.util
     from serial.tools import list_ports
     if importlib.util.find_spec("espefuse") is None:
         sys.exit('clampel: espefuse missing; run: python -m pip install esptool "bitstring<5"')
     sn = lamp_serial()
+    if not sn:
+        sys.exit("clampel: no lamp paired; run `clampel pair` first")
     print("This permanently disables flashing the lamp (%s) over USB." % sn)
     print("Afterwards only `clampel flash` or a USB-UART adapter on GPIO20/21 + BOOT can update it.")
     cmd_stop()
@@ -713,6 +738,42 @@ def reset_lamp(port):
     s.close()
 
 
+def cmd_pair(force):
+    """Write lamp.json from the one ESP32-C3 plugged in. Lists ports, never opens one:
+    any other C3 on the bench must not be touched."""
+    from serial.tools import list_ports
+    c3 = [p for p in list_ports.comports() if (p.vid, p.pid) == (0x303A, 0x1001) and p.serial_number]
+    if len(c3) != 1:
+        found = "".join("\n  %s  %s" % (p.device, p.serial_number) for p in c3) or " none"
+        sys.exit("clampel: plug in exactly one ESP32-C3 (the lamp) and no other; found:%s" % found)
+    port, sn = c3[0].device, c3[0].serial_number.upper()
+    old = lamp_serial()
+    if old == sn:
+        print("already paired with %s on %s" % (sn, port))
+        return
+    if old and not force:
+        sys.exit("clampel: lamp.json names %s, but the board plugged in is %s.\n"
+                 "Run `clampel pair --force` only if this board is the new lamp." % (old, sn))
+    write_json(LAMP_CFG, {"serial": sn})
+    print("paired: lamp %s on %s" % (sn, port))
+    if bridge_running():
+        print("restart the bridge to pick it up: `clampel stop`, then `clampel start`")
+
+
+def cmd_hooks():
+    """Print the hooks block for ~/.claude/settings.json with this clone's paths filled in.
+    The interpreter is absolute: a bare `python` can be the Microsoft Store stub, and
+    since hooks are async and swallow errors, the lamp would just stay dark."""
+    hooks = {}
+    for event, matcher, arg in HOOKS:
+        entry = {"hooks": [{"type": "command", "command": sys.executable,
+                            "args": ["-I", os.path.abspath(__file__), "hook", arg], "async": True}]}
+        hooks[event] = [dict({"matcher": matcher}, **entry) if matcher else entry]
+    print(json.dumps({"hooks": hooks}, indent=2))
+    print("Merge this into ~/.claude/settings.json. Where an event already has entries, "
+          "append these to its list and keep the others.", file=sys.stderr)
+
+
 def cmd_install():
     startup = os.path.join(os.environ["APPDATA"], r"Microsoft\Windows\Start Menu\Programs\Startup")
     lnk = os.path.join(startup, "clampel bridge.lnk")
@@ -728,6 +789,8 @@ def main(argv):
     if len(argv) < 2:
         sys.exit(__doc__)
     cmd, args = argv[1], argv[2:]
+    if sys.platform != "win32" and cmd != "hook":
+        sys.exit("clampel: Windows only for now (process table, Startup folder). See README, Porting.")
     if cmd == "hook":
         try:
             cmd_hook(args[0] if args else "")
@@ -736,6 +799,8 @@ def main(argv):
     elif cmd == "bridge":
         cmd_bridge()
     elif cmd == "start":
+        if not lamp_serial():
+            sys.exit("clampel: no lamp paired; run `clampel pair` first")
         ensure_bridge()
         print("bridge running" if (time.sleep(1.0) or bridge_running()) else "bridge failed to start, see %s" % LOG_PATH)
     elif cmd == "stop":
@@ -752,6 +817,10 @@ def main(argv):
         cmd_flash(args[0] if args else None)
     elif cmd == "fuse":
         cmd_fuse()
+    elif cmd == "pair":
+        cmd_pair("--force" in args)
+    elif cmd == "hooks":
+        cmd_hooks()
     elif cmd == "install":
         cmd_install()
     else:
